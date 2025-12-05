@@ -331,11 +331,6 @@ public class GestureTypingDetector {
       }
     }
 
-    if (startKey == null) {
-      Logger.w(TAG, "Could not find a key that is inside %d,%d", corners[0], corners[1]);
-      return mCandidates;
-    }
-
     mCandidateWeights.clear();
     int dictionaryWordsCornersOffset = 0;
     for (int dictIndex = 0; dictIndex < mWords.size(); dictIndex++) {
@@ -370,10 +365,10 @@ public class GestureTypingDetector {
         // Add a small penalty if the word doesn't start on the exact starting key
         // This biases towards words that start on the gesture starting key
         double proximityPenalty = 0;
-        if (wordStartKey != startKey) {
-          // Small penalty proportional to distance from start point
-          proximityPenalty = Math.sqrt(distanceSquared) * PROXIMITY_PENALTY_FACTOR;
-        }
+//        if (wordStartKey != startKey) {
+//          // Small penalty proportional to distance from start point
+//          proximityPenalty = Math.sqrt(distanceSquared) * PROXIMITY_PENALTY_FACTOR;
+//        }
 
         final double finalWeight = revisedDistanceFromCurve + proximityPenalty;
 
@@ -385,7 +380,7 @@ public class GestureTypingDetector {
 
         if (candidateDistanceSortedIndex < mMaxSuggestions) {
           mCandidateWeights.add(candidateDistanceSortedIndex, finalWeight);
-          mCandidates.add(candidateDistanceSortedIndex, new String(words[i]));
+          mCandidates.add(candidateDistanceSortedIndex, new String(words[i]) + ":" + String.format("%.2f", finalWeight));
           if (mCandidateWeights.size() > mMaxSuggestions) {
             mCandidateWeights.remove(mMaxSuggestions);
             mCandidates.remove(mMaxSuggestions);

@@ -28,7 +28,7 @@ public class ExternalAnyKeyboardTest {
 
         @Override
         public float getKeyHorizontalGap() {
-          return 1;
+          return 10;
         }
 
         @Override
