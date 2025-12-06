@@ -39,8 +39,18 @@ public class GestureTypingDetector {
    */
   private static final double PROXIMITY_PENALTY_FACTOR = 0.1;
 
-  // How far away do two points of the gesture have to be (distance squared)?
-  private final int mMinPointDistanceSquared;
+    /**
+     * Factor controlling how much direction mismatch penalizes distance in path comparison.
+     * The penalty multiplier is calculated as: 1 + DIRECTION_PENALTY_FACTOR * (1 - cos(θ))
+     * where θ is the angle between gesture direction and generated word direction.
+     * <p>
+     * At factor 1.0: same direction = 1×, perpendicular = 2×, opposite = 3×
+     * At factor 0.5: same direction = 1×, perpendicular = 1.5×, opposite = 2×
+     */
+    private static final double DIRECTION_PENALTY_FACTOR = 1.0;
+
+    // How far away do two points of the gesture have to be (distance squared)?
+    private final int mMinPointDistanceSquared;
 
   private final ArrayList<String> mCandidates;
   private final double mFrequencyFactor;
@@ -297,10 +307,16 @@ public class GestureTypingDetector {
     final int middleX = xs[middlePointIndex];
     final int middleY = ys[middlePointIndex];
 
-    final int firstSectionXDiff = startX - middleX;
-    final int firstSectionYDiff = startY - middleY;
-    final double firstSectionLength =
-        Math.sqrt(firstSectionXDiff * firstSectionXDiff + firstSectionYDiff * firstSectionYDiff);
+        final double radianValue = getArcInRadiansBetweenThreePoints(startX, startY, middleX, middleY, endX, endY);
+
+        return radianValue <= CURVATURE_THRESHOLD;
+    }
+
+    private static double getArcInRadiansBetweenThreePoints(int startX, int startY, int middleX, int middleY, int endX, int endY) {
+        final int firstSectionXDiff = startX - middleX;
+        final int firstSectionYDiff = startY - middleY;
+        final double firstSectionLength =
+                Math.sqrt(firstSectionXDiff * firstSectionXDiff + firstSectionYDiff * firstSectionYDiff);
 
     final int secondSectionXDiff = endX - middleX;
     final int secondSectionYDiff = endY - middleY;
@@ -442,30 +458,105 @@ public class GestureTypingDetector {
         }
       }
 
-      cumulativeDistance += distanceToGeneratedCorner;
-    }
+            // Calculate direction penalty if we have next points for both paths
+            double directionPenaltyMultiplier = 1.0;
 
-    // we finished the user-path, but for this word there could still be additional
-    // generated-path corners.
-    // we'll need to those too.
-    for (int ux = actualUserPath[actualUserPath.length - 2],
-            uy = actualUserPath[actualUserPath.length - 1];
-        generatedWordCornerIndex < generatedWordPath.length;
-        generatedWordCornerIndex += 2) {
-      cumulativeDistance +=
-          dist(
-              ux,
-              uy,
-              generatedWordPath[generatedWordCornerIndex],
-              generatedWordPath[generatedWordCornerIndex + 1]);
-    }
+            // Check if previous gesture point exists
+            // (userPathIndex >= 2 means we have a previous point)
+            boolean hasPreviousGesturePoint = userPathIndex >= 2;
+            // Check if previous generated point exists
+            // (generatedWordCornerIndex >= 2 means we have a previous point)
+            boolean hasPreviousGeneratedPoint = generatedWordCornerIndex >= 2;
+
+
+            if (hasPreviousGesturePoint && hasPreviousGeneratedPoint) {
+                // Calculate gesture direction vector (previous point → current point)
+                double gestureDirX = ux - actualUserPath[userPathIndex - 2];
+                double gestureDirY = uy - actualUserPath[userPathIndex - 1];
+
+                // Calculate generated word direction vector
+                double generatedDirX = wx - generatedWordPath[generatedWordCornerIndex - 2];
+                double generatedDirY = wy - generatedWordPath[generatedWordCornerIndex - 1];
+
+                // Calculate cosine of angle between direction vectors
+                double cosAngle = calculateCosineOfAngleBetweenVectors(
+                        gestureDirX, gestureDirY, generatedDirX, generatedDirY);
+
+                // Apply penalty: 1.0 for same direction (cos=1), up to 3.0 for opposite (cos=-1)
+                directionPenaltyMultiplier = 1.0 + DIRECTION_PENALTY_FACTOR * (1.0 - cosAngle);
+
+                // Store last gesture direction for potential use in second loop
+                lastGestureDirX = gestureDirX;
+                lastGestureDirY = gestureDirY;
+                hasLastGestureDirection = true;
+            }
+
+            cumulativeDistance += distanceToGeneratedCorner * directionPenaltyMultiplier;
+        }
+
+        // we finished the user-path, but for this word there could still be additional
+        // generated-path corners.
+        // we'll need to add those too, with direction penalty using last known gesture direction.
+        final int lastUx = actualUserPath[actualUserPath.length - 2];
+        final int lastUy = actualUserPath[actualUserPath.length - 1];
+
+        while (generatedWordCornerIndex < generatedWordPath.length) {
+            short wx = generatedWordPath[generatedWordCornerIndex];
+            short wy = generatedWordPath[generatedWordCornerIndex + 1];
+            double distance = dist(lastUx, lastUy, wx, wy);
+
+            // Apply direction penalty if we have last gesture direction and previous generated corner
+            double directionPenaltyMultiplier = 1.0;
+
+            // In this loop we always advance sequentially, so previous is generatedWordCornerIndex - 2
+            boolean hasPreviousGeneratedCorner = generatedWordCornerIndex >= 2;
+
+            if (hasLastGestureDirection && hasPreviousGeneratedCorner) {
+                // Calculate generated word direction vector (previous corner → current corner)
+                double generatedDirX = wx - generatedWordPath[generatedWordCornerIndex - 2];
+                double generatedDirY = wy - generatedWordPath[generatedWordCornerIndex - 1];
+
+                double cosAngle = calculateCosineOfAngleBetweenVectors(
+                        lastGestureDirX, lastGestureDirY, generatedDirX, generatedDirY);
+
+                directionPenaltyMultiplier = 1.0 + DIRECTION_PENALTY_FACTOR * (1.0 - cosAngle);
+            }
+
+            cumulativeDistance += distance * directionPenaltyMultiplier;
+            generatedWordCornerIndex += 2;
+        }
 
     return cumulativeDistance;
   }
 
-  private static double dist(double x1, double y1, double x2, double y2) {
-    return Math.sqrt((x2 - x1) * (x2 - x1) + (y2 - y1) * (y2 - y1));
-  }
+    /**
+     * Calculates the cosine of the angle between two 2D vectors.
+     * Uses the dot product formula: cos(θ) = (v1 · v2) / (|v1| * |v2|)
+     *
+     * @return cosine of angle between vectors, in range [-1, 1].
+     * Returns 1.0 (no penalty) if either vector has zero length.
+     */
+    private static double calculateCosineOfAngleBetweenVectors(
+            double v1x, double v1y, double v2x, double v2y) {
+        double magnitudeSquared1 = v1x * v1x + v1y * v1y;
+        double magnitudeSquared2 = v2x * v2x + v2y * v2y;
+
+        // If either vector has zero length, return 1.0 (no penalty)
+        if (magnitudeSquared1 == 0 || magnitudeSquared2 == 0) {
+            return 1.0;
+        }
+
+        double dotProduct = v1x * v2x + v1y * v2y;
+        double magnitudeProduct = Math.sqrt(magnitudeSquared1 * magnitudeSquared2);
+
+        // Clamp to [-1, 1] to handle floating point errors
+        double cosine = dotProduct / magnitudeProduct;
+        return Math.max(-1.0, Math.min(1.0, cosine));
+    }
+
+    private static double dist(double x1, double y1, double x2, double y2) {
+        return Math.sqrt((x2 - x1) * (x2 - x1) + (y2 - y1) * (y2 - y1));
+    }
 
   private static class WorkspaceData {
     static final int MAX_GESTURE_LENGTH = 1024;
