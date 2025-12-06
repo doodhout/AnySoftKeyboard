@@ -713,8 +713,7 @@ public class GestureTypingDetectorTest {
 
     // Should complete without crashing
     // "hello" should be in candidates, words with unknown characters should be skipped
-    Assert.assertTrue(
-        "Expected 'hello' to be in candidates", candidates.contains("hello"));
+    Assert.assertTrue("Expected 'hello' to be in candidates", candidates.contains("hello"));
   }
 
   @Test
