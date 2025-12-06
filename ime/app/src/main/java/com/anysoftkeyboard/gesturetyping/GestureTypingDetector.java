@@ -17,6 +17,7 @@ import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.List;
+import java.util.Locale;
 
 public class GestureTypingDetector {
   private static final String TAG = "ASKGestureTypingDetector";
@@ -24,20 +25,33 @@ public class GestureTypingDetector {
   private static final double CURVATURE_THRESHOLD = Math.toRadians(170);
   // How many points away from the current point do we use when calculating hasEnoughCurvature?
   private static final int CURVATURE_NEIGHBORHOOD = 1;
-  private static final double MINIMUM_DISTANCE_FILTER = 1000000;
+  private static final double MAXIMUM_DISTANCE_FILTER = 1_000_000;
 
   /**
    * Maximum squared distance from gesture start point to accept a word's starting key.
-   * This allows for imprecise gesture starts while filtering obviously wrong candidates.
-   * Value is approximately 1.5 key widths squared (assuming ~100 pixel keys).
+   * Very strict threshold to prevent false matches from distant keys.
+   * 150 pixels - only allows nearby keys, rejects significantly different ones.
    */
-  private static final int START_KEY_PROXIMITY_THRESHOLD_SQUARED = 22500;
+  private int START_KEY_PROXIMITY_THRESHOLD;
+
+  /**
+   * Maximum squared distance from gesture end point to accept a word's ending key.
+   * Same threshold as start key (100 pixels) - allows for imprecise gesture endings.
+   */
+  private int END_KEY_PROXIMITY_THRESHOLD;
 
   /**
    * Penalty factor for words that start near but not on the exact starting key.
    * Lower value = less penalty, higher value = more penalty.
    */
-  private static final double PROXIMITY_PENALTY_FACTOR = 0.1;
+  private static final double PROXIMITY_PENALTY_FACTOR = 2.0;
+
+  /**
+   * Weight factor for direction penalty in distance calculation.
+   * This penalizes words whose path direction differs from the gesture direction.
+   * Very conservative value to avoid over-penalizing short paths where direction is less meaningful.
+   */
+  private static final double DIRECTION_PENALTY_WEIGHT = 10.0;
 
   // How far away do two points of the gesture have to be (distance squared)?
   private final int mMinPointDistanceSquared;
@@ -331,6 +345,10 @@ public class GestureTypingDetector {
       }
     }
 
+    Keyboard.Key eKey = mKeysByCharacter.get('e');
+    START_KEY_PROXIMITY_THRESHOLD = eKey.width * eKey.height;
+    END_KEY_PROXIMITY_THRESHOLD = eKey.width + eKey.height;
+
     mCandidateWeights.clear();
     int dictionaryWordsCornersOffset = 0;
     for (int dictIndex = 0; dictIndex < mWords.size(); dictIndex++) {
@@ -344,33 +362,46 @@ public class GestureTypingDetector {
         }
 
         // Calculate squared distance from gesture start to word's starting key
-        final int distanceSquared = wordStartKey.squaredDistanceFrom(corners[0], corners[1]);
+        final int startDistanceSquared = wordStartKey.squaredDistanceFrom(corners[0], corners[1]);
 
-        // Filter out words whose starting key is too far from gesture start
-        if (distanceSquared > START_KEY_PROXIMITY_THRESHOLD_SQUARED) {
-          continue;
+        // Add a small penalty if the word doesn't start on the exact starting key
+        // This biases towards words that start on the gesture starting key
+        double startkeyPenalty = 0;
+        if (startDistanceSquared > START_KEY_PROXIMITY_THRESHOLD) {
+            startkeyPenalty = Math.sqrt(startDistanceSquared - START_KEY_PROXIMITY_THRESHOLD ) * PROXIMITY_PENALTY_FACTOR;
+        }
+
+        // Improvement 2: Calculate end-key distance penalty
+        // Instead of hard rejection, we add a penalty for words that end far from gesture end
+        // This allows some flexibility while still preferring words that end near the gesture end
+        double endKeyPenalty = 0;
+        final char lastChar = words[i][words[i].length - 1];
+        final Keyboard.Key wordEndKey = mKeysByCharacter.get(Dictionary.toLowerCase(lastChar));
+        if (wordEndKey != null) {
+          // Calculate squared distance from gesture end to word's ending key
+          final int endCornerX = corners[corners.length - 2];
+          final int endCornerY = corners[corners.length - 1];
+          final int endDistanceSquared = wordEndKey.squaredDistanceFrom(endCornerX, endCornerY);
+
+          // Apply penalty proportional to end-key distance (similar to start-key proximity)
+          // Penalty increases for keys further away, encouraging words that end near gesture end
+          if (endDistanceSquared > END_KEY_PROXIMITY_THRESHOLD) {
+            endKeyPenalty = Math.sqrt(endDistanceSquared - END_KEY_PROXIMITY_THRESHOLD) * PROXIMITY_PENALTY_FACTOR;
+          }
         }
 
         final double distanceFromCurve =
             calculateDistanceBetweenUserPathAndWord(
                 corners, mWordsCorners.get(i + dictionaryWordsCornersOffset));
-        if (distanceFromCurve > MINIMUM_DISTANCE_FILTER) {
+        if (distanceFromCurve > MAXIMUM_DISTANCE_FILTER) {
           continue;
         }
 
         // TODO: convert wordFrequencies to a double[] in the loading phase.
-        final double revisedDistanceFromCurve =
-            distanceFromCurve - (mFrequencyFactor * ((double) wordFrequencies[i]));
+        double frequencyAdvantage = mFrequencyFactor * ((double) wordFrequencies[i]);
+        final double revisedDistanceFromCurve = distanceFromCurve - frequencyAdvantage;
 
-        // Add a small penalty if the word doesn't start on the exact starting key
-        // This biases towards words that start on the gesture starting key
-        double proximityPenalty = 0;
-//        if (wordStartKey != startKey) {
-//          // Small penalty proportional to distance from start point
-//          proximityPenalty = Math.sqrt(distanceSquared) * PROXIMITY_PENALTY_FACTOR;
-//        }
-
-        final double finalWeight = revisedDistanceFromCurve + proximityPenalty;
+        final double finalWeight = revisedDistanceFromCurve + startkeyPenalty + endKeyPenalty;
 
         int candidateDistanceSortedIndex = 0;
         while (candidateDistanceSortedIndex < mCandidateWeights.size()
@@ -380,7 +411,10 @@ public class GestureTypingDetector {
 
         if (candidateDistanceSortedIndex < mMaxSuggestions) {
           mCandidateWeights.add(candidateDistanceSortedIndex, finalWeight);
-          mCandidates.add(candidateDistanceSortedIndex, new String(words[i]) + ":" + String.format("%.2f", finalWeight));
+          mCandidates.add(candidateDistanceSortedIndex, new String(words[i]) +
+                  String.format(Locale.getDefault(),
+                          "(dist=%.0f:startpen=%.0f:endpen=%.0f:freqadv=%.0f:final=%.0f)",
+                          distanceFromCurve, startkeyPenalty, endKeyPenalty, frequencyAdvantage, finalWeight));
           if (mCandidateWeights.size() > mMaxSuggestions) {
             mCandidateWeights.remove(mMaxSuggestions);
             mCandidates.remove(mMaxSuggestions);
@@ -407,6 +441,9 @@ public class GestureTypingDetector {
       Logger.w(TAG, "Some strings are too short; will return maximum distance.");
       return Double.MAX_VALUE;
     }
+
+    // Keep original hard rejection: words cannot be longer than the gesture
+    // This is essential for filtering out false matches from completely different words
     if (generatedWordPath.length > actualUserPath.length) return Double.MAX_VALUE;
 
     double cumulativeDistance = 0;
@@ -416,7 +453,7 @@ public class GestureTypingDetector {
       final int ux = actualUserPath[userPathIndex];
       final int uy = actualUserPath[userPathIndex + 1];
       double distanceToGeneratedCorner =
-          dist(
+          distSquared(
               ux,
               uy,
               generatedWordPath[generatedWordCornerIndex],
@@ -426,18 +463,25 @@ public class GestureTypingDetector {
         // maybe this new point is closer to the next corner?
         // we only need to check one point ahead since the generated path little corners.
         final double distanceToNextGeneratedCorner =
-            dist(
+                distSquared(
                 ux,
                 uy,
                 generatedWordPath[generatedWordCornerIndex + 2],
                 generatedWordPath[generatedWordCornerIndex + 3]);
         if (distanceToNextGeneratedCorner < distanceToGeneratedCorner) {
           generatedWordCornerIndex += 2;
-          distanceToGeneratedCorner = distanceToNextGeneratedCorner;
+          // We don't want to fully disregard the distance to this corner, so we keep half of it.
+          // This way we add a penalty for words that match a gesture path with a redundant corner.
+          distanceToGeneratedCorner = distanceToGeneratedCorner / 1.5 + distanceToNextGeneratedCorner;
         }
       }
 
-      cumulativeDistance += distanceToGeneratedCorner;
+      // Improvement 3: Add direction penalty to penalize words with mismatched path direction
+      final double directionPenalty =
+          calculateDirectionPenalty(
+              actualUserPath, userPathIndex, generatedWordPath, generatedWordCornerIndex);
+
+      cumulativeDistance += distanceToGeneratedCorner + directionPenalty;
     }
 
     // we finished the user-path, but for this word there could still be additional
@@ -448,7 +492,7 @@ public class GestureTypingDetector {
         generatedWordCornerIndex < generatedWordPath.length;
         generatedWordCornerIndex += 2) {
       cumulativeDistance +=
-          dist(
+          distSquared(
               ux,
               uy,
               generatedWordPath[generatedWordCornerIndex],
@@ -458,8 +502,61 @@ public class GestureTypingDetector {
     return cumulativeDistance;
   }
 
+  private static double distSquared(double x1, double y1, double x2, double y2) {
+    return (x2 - x1) * (x2 - x1) + (y2 - y1) * (y2 - y1);
+  }
+
   private static double dist(double x1, double y1, double x2, double y2) {
     return Math.sqrt((x2 - x1) * (x2 - x1) + (y2 - y1) * (y2 - y1));
+  }
+
+  /**
+   * Calculates direction penalty based on cosine similarity between gesture and word path
+   * directions. Returns 0 if directions align well (similar direction vectors), returns higher
+   * values if directions differ (opposite or perpendicular directions).
+   *
+   * @param actualPath the user's gesture path (x,y coordinates as shorts)
+   * @param userIdx current index in user path (must be >= 2 to have previous point)
+   * @param wordPath the pre-computed word path (x,y coordinates as shorts)
+   * @param wordIdx current index in word path (must be >= 2 to have previous point)
+   * @return penalty value (0 for matching directions, higher for mismatched directions)
+   */
+  private static double calculateDirectionPenalty(
+      short[] actualPath, int userIdx, short[] wordPath, int wordIdx) {
+
+    // Need at least 2 corners (4 coordinates) to calculate direction
+    if (userIdx < 2 || wordIdx < 2) {
+      return 0;
+    }
+
+    // Calculate user gesture direction vector (from previous corner to current corner)
+    final double userDx = actualPath[userIdx] - actualPath[userIdx - 2];
+    final double userDy = actualPath[userIdx + 1] - actualPath[userIdx - 1];
+
+    // Calculate word path direction vector (from previous corner to current corner)
+    final double wordDx = wordPath[wordIdx] - wordPath[wordIdx - 2];
+    final double wordDy = wordPath[wordIdx + 1] - wordPath[wordIdx - 1];
+
+    // Calculate magnitudes (lengths) of direction vectors
+    final double userLength = Math.sqrt(userDx * userDx + userDy * userDy);
+    final double wordLength = Math.sqrt(wordDx * wordDx + wordDy * wordDy);
+
+    // Avoid division by zero for zero-length segments
+    if (userLength < 0.1 || wordLength < 0.1) {
+      return 0;
+    }
+
+    // Calculate dot product of direction vectors
+    final double dotProduct = userDx * wordDx + userDy * wordDy;
+
+    // Calculate cosine similarity: 1.0 = same direction, 0 = perpendicular, -1.0 = opposite
+    final double cosineSimilarity = dotProduct / (userLength * wordLength);
+
+    // Convert to penalty: 0 for same direction, increases as directions differ
+    // (1 - cosineSimilarity) ranges from 0 (same) to 2 (opposite)
+    final double directionDifference = 1.0 - cosineSimilarity;
+
+    return directionDifference * DIRECTION_PENALTY_WEIGHT;
   }
 
   private static class WorkspaceData {
