@@ -415,20 +415,42 @@ public class GestureTypingDetector {
     return mCandidates;
   }
 
-  private static double calculateDistanceBetweenUserPathAndWord(
-      short[] actualUserPath, short[] generatedWordPath) {
-    // Debugging is still needed, but at least ASK won't crash this way
-    if (actualUserPath.length < 2 || generatedWordPath.length == 0) {
-      Logger.w(
-          TAG,
-          "calculateDistanceBetweenUserPathAndWord: actualUserPath = \"%s\","
-              + " generatedWordPath = \"%s\"",
-          actualUserPath,
-          generatedWordPath);
-      Logger.w(TAG, "Some strings are too short; will return maximum distance.");
-      return Double.MAX_VALUE;
-    }
-    if (generatedWordPath.length > actualUserPath.length) return Double.MAX_VALUE;
+    /**
+     * Iterate over all gesture path corners.
+     *
+     * Until the next generated word path corner is closer, keep calculating and cumulating the
+     * distance between the current generated word path corner and the next gesture path corner.
+     *
+     * For each iteration over a gesture path corner, compare the vector direction of this current
+     * gesture path segment with the vector direction of the current generated word path segment:
+     * - when both vectors have exactly the same direction (0°), then distance is considered zero,
+     * - when the vectors are perpendicular in direction (90°), then distance is considered normal,
+     * - when the vectors are opposite in direction (180°), then distance is doubled,
+     * - ... and everything in-between.
+     *
+     * The motivation for adding this vector direction advantage/penalty is to punish generated word
+     * paths that come close to the gesture path corners, but go in a very different direction.
+     * Hence, distance alone is not enough to properly consider matching word paths.
+     *
+     * @param actualUserPath the flat array of gesture path coordinates
+     * @param generatedWordPath the flat array of generated word path coordinates
+     * @return the cumulative distance between gesture path corners and word path corners, for each
+     *         segment multiplied by the reward/penalty factor for adhering to the direction.
+     */
+    private static double calculateDistanceBetweenUserPathAndWord(
+            short[] actualUserPath, short[] generatedWordPath) {
+        // Debugging is still needed, but at least ASK won't crash this way
+        if (actualUserPath.length < 2 || generatedWordPath.length == 0) {
+            Logger.w(
+                    TAG,
+                    "calculateDistanceBetweenUserPathAndWord: actualUserPath = \"%s\","
+                            + " generatedWordPath = \"%s\"",
+                    actualUserPath,
+                    generatedWordPath);
+            Logger.w(TAG, "Some strings are too short; will return maximum distance.");
+            return Double.MAX_VALUE;
+        }
+        if (generatedWordPath.length > actualUserPath.length) return Double.MAX_VALUE;
 
     double cumulativeDistance = 0;
     int generatedWordCornerIndex = 0;
@@ -442,6 +464,17 @@ public class GestureTypingDetector {
               uy,
               generatedWordPath[generatedWordCornerIndex],
               generatedWordPath[generatedWordCornerIndex + 1]);
+        // Track last gesture direction for use in second loop
+        double lastGestureDirX = 0;
+        double lastGestureDirY = 0;
+        boolean hasLastGestureDirection = false;
+
+        for (int userPathIndex = 0; userPathIndex < actualUserPath.length; userPathIndex += 2) {
+            final int ux = actualUserPath[userPathIndex];
+            final int uy = actualUserPath[userPathIndex + 1];
+            int wx = generatedWordPath[generatedWordCornerIndex];
+            int wy = generatedWordPath[generatedWordCornerIndex + 1];
+            double distanceToGeneratedCorner = dist(ux, uy, wx, wy);
 
       if (generatedWordCornerIndex < generatedWordPath.length - 2) {
         // maybe this new point is closer to the next corner?
@@ -457,6 +490,19 @@ public class GestureTypingDetector {
           distanceToGeneratedCorner = distanceToNextGeneratedCorner;
         }
       }
+            if (generatedWordCornerIndex < generatedWordPath.length - 2) {
+                // maybe this new point is closer to the next corner?
+                // we only need to check one point ahead since the generated path little corners.
+                short nextWx = generatedWordPath[generatedWordCornerIndex + 2];
+                short nextWy = generatedWordPath[generatedWordCornerIndex + 3];
+                final double distanceToNextGeneratedCorner = dist(ux, uy, nextWx, nextWy);
+                if (distanceToNextGeneratedCorner < distanceToGeneratedCorner) {
+                    generatedWordCornerIndex += 2;
+                    distanceToGeneratedCorner = distanceToNextGeneratedCorner;
+                    wx = nextWy;
+                    wy = nextWy;
+                }
+            }
 
             // Calculate direction penalty if we have next points for both paths
             double directionPenaltyMultiplier = 1.0;
@@ -482,8 +528,8 @@ public class GestureTypingDetector {
                 double cosAngle = calculateCosineOfAngleBetweenVectors(
                         gestureDirX, gestureDirY, generatedDirX, generatedDirY);
 
-                // Apply penalty: 1.0 for same direction (cos=1), up to 3.0 for opposite (cos=-1)
-                directionPenaltyMultiplier = 1.0 + DIRECTION_PENALTY_FACTOR * (1.0 - cosAngle);
+                // Apply penalty: 0.0 for same direction (cos=1), up to 2.0 for opposite (cos=-1)
+                directionPenaltyMultiplier = DIRECTION_PENALTY_FACTOR * (1.0 - cosAngle);
 
                 // Store last gesture direction for potential use in second loop
                 lastGestureDirX = gestureDirX;
@@ -519,7 +565,8 @@ public class GestureTypingDetector {
                 double cosAngle = calculateCosineOfAngleBetweenVectors(
                         lastGestureDirX, lastGestureDirY, generatedDirX, generatedDirY);
 
-                directionPenaltyMultiplier = 1.0 + DIRECTION_PENALTY_FACTOR * (1.0 - cosAngle);
+                // Apply penalty: 0.0 for same direction (cos=1), up to 2.0 for opposite (cos=-1)
+                directionPenaltyMultiplier = DIRECTION_PENALTY_FACTOR * (1.0 - cosAngle);
             }
 
             cumulativeDistance += distance * directionPenaltyMultiplier;
